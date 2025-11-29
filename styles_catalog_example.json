@@ -1,0 +1,46 @@
+{
+  "styles": [
+    {
+      "style_id": "pixie_classic_01",
+      "name": "Pixie classique",
+      "tags": {
+        "shapes": [
+          "oval",
+          "heart",
+          "round"
+        ],
+        "length": "short",
+        "texture": [
+          "straight",
+          "wavy"
+        ],
+        "fringe": "ok"
+      },
+      "assets": {
+        "overlay2d": "cdn/overlays/pixie_classic_01.png",
+        "ref_image": "cdn/refs/pixie_classic_01.jpg"
+      }
+    },
+    {
+      "style_id": "french_bob_01",
+      "name": "Bob court au menton",
+      "tags": {
+        "shapes": [
+          "oval",
+          "diamond",
+          "heart"
+        ],
+        "length": "short",
+        "texture": [
+          "straight",
+          "wavy"
+        ],
+        "fringe": "no"
+      },
+      "assets": {
+        "overlay2d": "cdn/overlays/french_bob_01.png",
+        "ref_image": "cdn/refs/french_bob_01.jpg"
+      }
+    }
+  ]
+}

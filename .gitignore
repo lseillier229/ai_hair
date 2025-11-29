@@ -1,0 +1,8 @@
+.venv/
+venv/
+*/.venv/
+*/venv/
+.models/
+models/
+*/.models/
+*/models/
