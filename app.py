@@ -8,6 +8,7 @@ import streamlit as st
 from PIL import Image
 from streamlit_webrtc import webrtc_streamer, VideoTransformerBase, WebRtcMode, RTCConfiguration
 import mediapipe as mp
+from hair_transfer import HairTransfer  
 
 # ----- (optionnel) ONNX Runtime pour BiSeNet -----
 try:
@@ -15,7 +16,9 @@ try:
     HAS_ORT = True
 except Exception:
     HAS_ORT = False
-print(HAS_ORT)
+
+print("HAS_ORT:", HAS_ORT)
+
 st.set_page_config(page_title="Caméra/Image • Forme du visage + Masque", layout="wide")
 st.title("💇 Caméra / Image — Forme du visage + Masque (BiSeNet optionnel)")
 st.caption("• Onglet **Caméra** (direct) ou **Image** (uploader). • Face Mesh → forme. • BiSeNet ONNX si présent → masque cheveux, sinon Selfie Segmentation (personne).")
@@ -72,7 +75,7 @@ HAIRSTYLE_RECOMMENDATIONS = {
             {"name": "Side Part moyen", "description": "Volume latéral pour équilibrer", "convient": "⭐⭐⭐"},
             {"name": "Fringe latérale", "description": "Frange sur le côté, réduit le front", "convient": "⭐⭐⭐"},
             {"name": "Textured medium", "description": "Mi-long avec texture", "convient": "⭐⭐⭐"},
-            {"name": "Cheveux longs", "description": "Ajoute du volume près du menton", "convient": "⭐⭐"},
+            {"name": "Cheveux longs", "description": "Ajoute de volume près du menton", "convient": "⭐⭐"},
             {"name": "Éviter", "description": "Trop de volume sur le dessus", "convient": "❌"},
         ]
     },
@@ -107,14 +110,12 @@ HAIRSTYLE_RECOMMENDATIONS = {
 }
 
 def get_recommendations(face_shape):
-    """Retourne les recommandations de coiffures pour une forme de visage."""
     return HAIRSTYLE_RECOMMENDATIONS.get(face_shape, HAIRSTYLE_RECOMMENDATIONS["unknown"])
 
 def dist(a, b):
     return float(np.hypot(a[0]-b[0], a[1]-b[1]))
 
 def face_shape_from_landmarks(landmarks_xy):
-    """Heuristique simple pour classer la forme du visage (démo)."""
     pts = {k: landmarks_xy[v] for k, v in IDX.items()}
     length = dist(pts["forehead"], pts["chin"])
     width_cheek = dist(pts["left_zyg"], pts["right_zyg"])
@@ -133,7 +134,7 @@ def face_shape_from_landmarks(landmarks_xy):
     if (jaw_cheek < 0.92) and (temp_cheek <= 0.98) and (0.80 <= cheek_len <= 0.95): shape = "heart" if temp_cheek < 0.94 else "diamond"
     return shape, ratios
 
-# ====== BiSeNet ONNX helper (optionnel) ======
+# ====== BiSeNet ONNX helper ======
 class BiseNetHairONNX:
     def __init__(self, onnx_path: str, hair_class_id: int = 13, providers=None):
         assert HAS_ORT, "onnxruntime non installé"
@@ -147,12 +148,11 @@ class BiseNetHairONNX:
         self.session = ort.InferenceSession(onnx_path, sess_options=so, providers=providers)
         inp = self.session.get_inputs()[0]
         self.input_name = inp.name
-        # Déduit input_size si le modèle le fixe, sinon 512 par défaut
         try:
-            h, w = [d if isinstance(d, int) else 512 for d in inp.shape[-2:]]
+            h, w = [d if isinstance(d, int) else 256 for d in inp.shape[-2:]]
             self.input_size = int(h)
         except Exception:
-            self.input_size = 512
+            self.input_size = 256
 
         outs = self.session.get_outputs()
         self.output_name = max(outs, key=lambda o: len([d for d in (o.shape or []) if d is not None])).name
@@ -174,7 +174,6 @@ class BiseNetHairONNX:
         x = self._pre(bgr, mode=pre_mode)
         y = self.session.run([self.output_name], {self.input_name: x})[0]
 
-        # y: (N,C,H,W) ou (N,H,W)
         if y.ndim == 4:
             logits = y
             if apply_softmax:
@@ -184,7 +183,7 @@ class BiseNetHairONNX:
             else:
                 pred = np.argmax(logits, axis=1)[0].astype(np.uint8)
         elif y.ndim == 3:
-            pred = y[0].astype(np.uint8)  # déjà argmax côté modèle
+            pred = y[0].astype(np.uint8)
         else:
             raise RuntimeError(f"Sortie ONNX inattendue: shape={y.shape}")
 
@@ -195,7 +194,6 @@ class BiseNetHairONNX:
 
 
 def overlay_mask(frame_bgr, mask_prob, alpha=0.35, color=(255,0,0)):
-    """Colore (semi-transparent) les pixels du masque. color en BGR."""
     if alpha <= 0.0:
         return frame_bgr
     m = (mask_prob*255).astype(np.uint8)
@@ -205,11 +203,123 @@ def overlay_mask(frame_bgr, mask_prob, alpha=0.35, color=(255,0,0)):
     over[m>128] = cv2.addWeighted(frame_bgr[m>128], 1-alpha, colored[m>128], alpha, 0)
     return over
 
+# ====== Filtre coiffure rapide pour le live ======
+class FastHairFilter:
+    """
+    Filtre 'Snap' rapide :
+    - segmente les cheveux de la source UNE FOIS avec BiSeNet
+    - ensuite, par frame : juste resize + collage sur le visage
+    """
+    def __init__(self, source_bgr, onnx_path, hair_class_id=13):
+        self.ready = False
+        self.hair_region = None
+        self.hair_mask_region = None
+
+        if not HAS_ORT or not os.path.isfile(onnx_path):
+            print("[FastHairFilter] onnxruntime ou modèle introuvable, désactivé.")
+            return
+
+        try:
+            bisenet = BiseNetHairONNX(onnx_path, hair_class_id=hair_class_id)
+            sh, sw = source_bgr.shape[:2]
+            hair_mask = bisenet.infer_hair(source_bgr, sh, sw)
+            ys, xs = np.where(hair_mask > 0.5)
+            if len(ys) == 0:
+                print("[FastHairFilter] Aucun cheveux trouvé dans la source.")
+                return
+
+            y_min, y_max = ys.min(), ys.max()
+            x_min, x_max = xs.min(), xs.max()
+
+            self.hair_region = source_bgr[y_min:y_max, x_min:x_max].copy()
+            self.hair_mask_region = hair_mask[y_min:y_max, x_min:x_max].copy().astype(np.float32)
+            self.ready = True
+            print("[FastHairFilter] Coiffure prête pour le live.")
+
+        except Exception as e:
+            print(f"[FastHairFilter] Erreur init: {e}")
+            self.ready = False
+
+    @staticmethod
+    def _get_face_bounds(landmarks):
+        if landmarks is None or len(landmarks) < 468:
+            return None
+        forehead = landmarks[10]
+        chin = landmarks[152]
+        left = landmarks[234]
+        right = landmarks[454]
+        return {
+            "center_x": (left[0] + right[0]) // 2,
+            "center_y": (forehead[1] + chin[1]) // 2,
+            "width": abs(right[0] - left[0]),
+            "height": abs(chin[1] - forehead[1]),
+            "top": forehead[1]
+        }
+
+    def apply(self, target_bgr, landmarks_xy, hairline_ratio=0.45):
+        """
+        hairline_ratio = part de la hauteur de la coiffure au-dessus du front.
+        0.25 = trop bas (sur le front), 0.45 ≈ plus au niveau de la racine.
+        """
+        if not self.ready or self.hair_region is None or self.hair_mask_region is None:
+            return target_bgr
+        if landmarks_xy is None:
+            return target_bgr
+
+        bounds = self._get_face_bounds(landmarks_xy)
+        if bounds is None:
+            return target_bgr
+
+        th, tw = target_bgr.shape[:2]
+        src_h, src_w = self.hair_region.shape[:2]
+
+        face_w = bounds["width"]
+        face_h = bounds["height"]
+
+        scale_w = (face_w * 1.5) / max(src_w, 1)
+        scale_h = (face_h * 1.4) / max(src_h, 1)
+        scale = min(scale_w, scale_h)
+
+        new_w = max(10, int(src_w * scale))
+        new_h = max(10, int(src_h * scale))
+
+        hair_resized = cv2.resize(self.hair_region, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        mask_resized = cv2.resize(self.hair_mask_region, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+
+        # ICI on remonte un peu plus la coiffure
+        paste_x = int(bounds["center_x"] - new_w // 2)
+        paste_y = int(bounds["top"] - new_h * hairline_ratio)
+
+        x1 = max(0, paste_x)
+        y1 = max(0, paste_y)
+        x2 = min(tw, paste_x + new_w)
+        y2 = min(th, paste_y + new_h)
+
+        if x2 <= x1 or y2 <= y1:
+            return target_bgr
+
+        fx1 = x1 - paste_x
+        fy1 = y1 - paste_y
+        fx2 = fx1 + (x2 - x1)
+        fy2 = fy1 + (y2 - y1)
+
+        fg = hair_resized[fy1:fy2, fx1:fx2].astype(np.float32)
+        mk = mask_resized[fy1:fy2, fx1:fx2].astype(np.float32)[..., None]
+        mk_3 = np.repeat(mk, 3, axis=2)
+
+        out = target_bgr.copy().astype(np.float32)
+        bg_roi = out[y1:y2, x1:x2]
+
+        blended = fg * mk_3 + bg_roi * (1.0 - mk_3)
+        out[y1:y2, x1:x2] = blended
+
+        return out.astype(np.uint8)
+
 # ====== UI (contrôles) ======
 st.sidebar.header("Modes")
 mode = st.sidebar.radio("Choisis un mode :", ["🖼️ Image (upload)", "🎥 Caméra (live)"], index=0)
 
-use_bisenet = st.sidebar.checkbox("Utiliser BiSeNet ONNX si disponible", value=True)
+use_bisenet = st.sidebar.checkbox("Utiliser BiSeNet ONNX si disponible (masque)", value=True)
 bisenet_path = st.sidebar.text_input("Chemin modèle BiSeNet (.onnx)", "models/bisenet_faceparsing.onnx")
 
 st.sidebar.markdown("---")
@@ -219,65 +329,132 @@ color_map = {"Rouge": (0,0,255), "Bleu": (255,0,0), "Vert": (0,255,0), "Jaune": 
 mask_color = color_map[mask_color_choice]
 mask_alpha = 0.35 if show_mask else 0.0
 
+st.sidebar.markdown("---")
+st.sidebar.subheader("Filtre coiffure (live)")
+enable_hair_filter = st.sidebar.checkbox("Activer le filtre coiffure sur la caméra", value=False)
+hair_source_path = st.sidebar.text_input("Chemin de l'image coiffure à tester", value="hairstyle_images/img_align_celeba/000005.jpg")
+
 # ====== MODE CAMÉRA ======
 class LiveTransformer(VideoTransformerBase):
     def __init__(self, use_bisenet=False, bisenet_path="models/bisenet_faceparsing.onnx",
-                 mask_alpha=0.35, mask_color=(255,0,0)):
-        self.face_mesh = mp_face_mesh.FaceMesh(max_num_faces=1, refine_landmarks=True,
-                                               min_detection_confidence=0.5, min_tracking_confidence=0.5)
-        self.seg_fallback = mp_selfie_seg.SelfieSegmentation(model_selection=1)
+                 mask_alpha=0.35, mask_color=(255,0,0),
+                 enable_hair_filter=False, hair_source_path=None):
+
+        self.frame_idx = 0
         self.last_shape = "oval"
+        self.last_landmarks = None
+
+        # Face mesh SANS refine_landmarks pour gagner du temps
+        self.face_mesh = mp_face_mesh.FaceMesh(
+            max_num_faces=1,
+            refine_landmarks=False,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5
+        )
+        self.seg_fallback = mp_selfie_seg.SelfieSegmentation(model_selection=1)
+
         self.use_bisenet = False
         self.bisenet = None
         self.mask_alpha = mask_alpha
         self.mask_color = mask_color
+
         if use_bisenet and HAS_ORT and os.path.isfile(bisenet_path):
             try:
-                print("cacaboudin")
                 self.bisenet = BiseNetHairONNX(bisenet_path, hair_class_id=13)
                 self.use_bisenet = True
+                print("[BiSeNet] prêt pour le masque live.")
             except Exception as e:
                 print("[BiSeNet] Load failed:", e)
 
+        self.enable_hair_filter = enable_hair_filter
+        self.fast_hair = None
+
+        if self.enable_hair_filter and hair_source_path and os.path.isfile(hair_source_path):
+            try:
+                src_bgr = cv2.imread(hair_source_path)
+                if src_bgr is not None:
+                    self.fast_hair = FastHairFilter(src_bgr, bisenet_path)
+                else:
+                    print(f"[Live] Impossible de lire la coiffure: {hair_source_path}")
+            except Exception as e:
+                print(f"[Live] Erreur init FastHairFilter: {e}")
+        elif self.enable_hair_filter:
+            print(f"[Live] Fichier coiffure introuvable: {hair_source_path}")
+
     def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
-        img = frame.to_ndarray(format="bgr24")
+        img_full = frame.to_ndarray(format="bgr24")
+        h_full, w_full, _ = img_full.shape
+
+        # Downscale pour traitement
+        target_width = 480
+        scale = target_width / w_full
+        new_w = target_width
+        new_h = int(h_full * scale)
+
+        img = cv2.resize(img_full, (new_w, new_h))
         h, w, _ = img.shape
         rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
-        # Face mesh → forme
-        res = self.face_mesh.process(rgb)
+        # FaceMesh avec frame skipping
+        self.frame_idx += 1
+        recompute_face = (self.frame_idx % 3 == 0)
+
+        landmarks_xy = None
         shape = self.last_shape
-        if res.multi_face_landmarks:
-            lms = res.multi_face_landmarks[0]
-            pts = np.array([(lm.x*w, lm.y*h) for lm in lms.landmark], dtype=np.float32)
-            shape, _ = face_shape_from_landmarks(pts)
-            mp_drawing.draw_landmarks(
-                image=img, landmark_list=lms,
-                connections=mp_face_mesh.FACEMESH_CONTOURS,
-                landmark_drawing_spec=None,
-                connection_drawing_spec=mp_drawing_styles.get_default_face_mesh_contours_style(),
-            )
-            self.last_shape = shape
 
-        # Masque cheveux (BiSeNet) ou fallback (personne)
-        label = "pas bisenet"
-        if self.use_bisenet and self.bisenet is not None:
-            try:
-                hair = self.bisenet.infer_hair(img, h, w)
-                out = overlay_mask(img, hair, alpha=self.mask_alpha, color=self.mask_color)
-                label = "cheveux (BiSeNet)"
-            except Exception:
-                m = self.seg_fallback.process(rgb).segmentation_mask
-                out = overlay_mask(img, m, alpha=self.mask_alpha, color=self.mask_color)
+        if recompute_face:
+            res = self.face_mesh.process(rgb)
+            if res.multi_face_landmarks:
+                lms = res.multi_face_landmarks[0]
+                landmarks_xy = [(int(lm.x * w), int(lm.y * h)) for lm in lms.landmark]
+                pts = np.array(landmarks_xy, dtype=np.float32)
+                shape, _ = face_shape_from_landmarks(pts)
+                self.last_shape = shape
+                self.last_landmarks = landmarks_xy
+                # ❌ On NE dessine PAS les traits blancs en live
         else:
-            m = self.seg_fallback.process(rgb).segmentation_mask
-            out = overlay_mask(img, m, alpha=self.mask_alpha, color=self.mask_color)
+            landmarks_xy = self.last_landmarks
 
-        cv2.rectangle(out, (10,10), (560,90), (0,0,0), -1)
-        cv2.putText(out, f"Forme: {shape}  |  Masque: {label}", (20,60),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2, cv2.LINE_AA)
-        return av.VideoFrame.from_ndarray(out, format="bgr24")
+        out = img.copy()
+        label = "pas bisenet"
 
+        # Filtre coiffure
+        if self.enable_hair_filter and self.fast_hair is not None and landmarks_xy is not None:
+            out = self.fast_hair.apply(out, landmarks_xy, hairline_ratio=0.45)
+            label = "filtre coiffure"
+
+        # Sinon masque rouge
+        if label != "filtre coiffure":
+            if self.use_bisenet and self.bisenet is not None:
+                try:
+                    hair = self.bisenet.infer_hair(img, h, w)
+                    out = overlay_mask(out, hair, alpha=self.mask_alpha, color=self.mask_color)
+                    label = "cheveux (BiSeNet)"
+                except Exception as e:
+                    print(f"[BiSeNet] Erreur, fallback selfie_seg: {e}")
+                    m = self.seg_fallback.process(rgb).segmentation_mask
+                    out = overlay_mask(out, m, alpha=self.mask_alpha, color=self.mask_color)
+            else:
+                m = self.seg_fallback.process(rgb).segmentation_mask
+                out = overlay_mask(out, m, alpha=self.mask_alpha, color=self.mask_color)
+
+        # HUD + upscale
+        cv2.rectangle(out, (10,10), (620,90), (0,0,0), -1)
+        cv2.putText(
+            out,
+            f"Forme: {shape}  |  Mode: {label}",
+            (20,60),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (255,255,255),
+            2,
+            cv2.LINE_AA
+        )
+
+        out_full = cv2.resize(out, (w_full, h_full))
+        return av.VideoFrame.from_ndarray(out_full, format="bgr24")
+
+# ====== MODE CAMÉRA ======
 if mode == "🎥 Caméra (live)":
     st.info("Autorise la caméra dans le navigateur (icône 🔒 à gauche de l'URL). En hébergé, utilise HTTPS.")
     rtc_config = RTCConfiguration({"iceServers":[{"urls":["stun:stun.l.google.com:19302"]}]})
@@ -291,20 +468,26 @@ if mode == "🎥 Caméra (live)":
             bisenet_path=bisenet_path,
             mask_alpha=mask_alpha,
             mask_color=mask_color,
+            enable_hair_filter=enable_hair_filter,
+            hair_source_path=hair_source_path,
         ),
     )
 
 # ====== MODE IMAGE (upload) ======
+# (inchangé, je le laisse comme tu l’avais, avec les analyses, recommandations, etc.)
+# Si tu veux aussi retirer les traits blancs sur les images, il suffit de commenter
+# le mp_drawing.draw_landmarks dans la partie "Image (upload)" également.
+
 if mode == "🖼️ Image (upload)":
     uploaded = st.file_uploader("Choisir une image", type=["jpg","jpeg","png"])
     if uploaded is None:
         st.warning("Sélectionne une image pour lancer l'analyse.")
     else:
         try:
-            file_bytes = uploaded.getvalue()  # robuste au rerun Streamlit
+            file_bytes = uploaded.getvalue()
             pil_img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
-            rgb_np = np.array(pil_img)                     # (H,W,3) RGB
-            bgr = cv2.cvtColor(rgb_np, cv2.COLOR_RGB2BGR)  # OpenCV en BGR
+            rgb_np = np.array(pil_img)
+            bgr = cv2.cvtColor(rgb_np, cv2.COLOR_RGB2BGR)
         except Exception as e:
             st.error(f"Impossible de lire l'image: {e}")
             st.stop()
@@ -313,7 +496,7 @@ if mode == "🖼️ Image (upload)":
 
         # Face mesh statique
         with mp_face_mesh.FaceMesh(static_image_mode=True, max_num_faces=1, refine_landmarks=True) as fm:
-            res = fm.process(rgb_np)  # MediaPipe accepte un RGB np.array
+            res = fm.process(rgb_np)
             shape = "unknown"
             vis = bgr.copy()
             if res.multi_face_landmarks:
@@ -333,12 +516,12 @@ if mode == "🖼️ Image (upload)":
         try:
             if use_bisenet and HAS_ORT and os.path.isfile(bisenet_path):
                 bn = BiseNetHairONNX(bisenet_path, hair_class_id=13)
-                hair_mask = bn.infer_hair(bgr, h, w)  # 0..1
+                hair_mask = bn.infer_hair(bgr, h, w)
                 out = overlay_mask(vis, hair_mask, alpha=mask_alpha, color=mask_color)
                 label = "cheveux (BiSeNet)"
             else:
                 seg = mp_selfie_seg.SelfieSegmentation(model_selection=1)
-                m = seg.process(rgb_np).segmentation_mask  # 0..1
+                m = seg.process(rgb_np).segmentation_mask
                 out = overlay_mask(vis, m, alpha=mask_alpha, color=mask_color)
                 hair_mask = m
         except Exception as e:
@@ -356,17 +539,13 @@ if mode == "🖼️ Image (upload)":
         try:
             from hair_analysis import analyze_hair, build_clip_query, get_hair_description
             
-            # Récupérer les landmarks pour l'analyse
             landmarks_for_analysis = None
             if res.multi_face_landmarks:
                 lms = res.multi_face_landmarks[0]
                 landmarks_for_analysis = [(int(lm.x * w), int(lm.y * h)) for lm in lms.landmark]
             
-            # Analyser les cheveux
             hair_info = analyze_hair(bgr, hair_mask, landmarks_for_analysis)
             hair_description = get_hair_description(hair_info)
-            
-            # Construire les requêtes CLIP personnalisées
             custom_queries = build_clip_query(shape, hair_info)
             
         except Exception as e:
@@ -379,7 +558,6 @@ if mode == "🖼️ Image (upload)":
                  caption=f"Forme: {shape} • Masque: {label}",
                  use_container_width=True)
         
-        # Afficher l'analyse des cheveux
         st.info(f"📊 **Analyse de tes cheveux:** {hair_description}")
 
         # ====== ESSAYAGE VIRTUEL ======
@@ -389,11 +567,8 @@ if mode == "🖼️ Image (upload)":
         
         try:
             from virtual_tryon import apply_hairstyle_overlay, setup_demo_overlays, OVERLAY_CATALOG
-            
-            # Créer les overlays de démo si nécessaire
             setup_demo_overlays()
             
-            # Mapping forme de visage → coiffures recommandées
             RECOMMENDED_STYLES = {
                 "oval": ["pompadour", "quiff", "side_part", "buzz_cut", "long_straight"],
                 "round": ["pompadour", "quiff"],
@@ -404,7 +579,6 @@ if mode == "🖼️ Image (upload)":
                 "unknown": ["pompadour", "quiff", "side_part"]
             }
             
-            # Filtrer les overlays par recommandation
             recommended_ids = RECOMMENDED_STYLES.get(shape, RECOMMENDED_STYLES["oval"])
             available_overlays = [
                 {"id": k, "name": v["name"], "description": v["description"]}
@@ -475,7 +649,6 @@ if mode == "🖼️ Image (upload)":
         st.subheader("🎯 Nouvelles coiffures recommandées pour toi")
         st.caption("Coiffures DIFFÉRENTES de ton style actuel, mais adaptées à ta forme de visage")
         
-        # Vérifier si l'index existe
         index_exists = os.path.exists("hairstyle_index/faiss.index")
         
         if not index_exists:
@@ -485,7 +658,6 @@ if mode == "🖼️ Image (upload)":
             try:
                 from hairstyle_search import recommend_different_styles, search_by_text
                 
-                # Recommandations automatiques à l'upload avec analyse des cheveux
                 with st.spinner("🔄 Analyse de ton style et recherche de nouvelles coiffures..."):
                     results = recommend_different_styles(
                         current_image=rgb_np,
@@ -499,7 +671,6 @@ if mode == "🖼️ Image (upload)":
                         st.success(f"✅ {len(results)} nouvelles coiffures recommandées pour ton visage {shape}")
                         st.caption("Clique sur 'Essayer' pour voir cette coiffure sur toi !")
                         
-                        # Stocker les résultats pour l'essayage
                         if "recommended_styles" not in st.session_state:
                             st.session_state.recommended_styles = []
                         st.session_state.recommended_styles = results
@@ -508,12 +679,10 @@ if mode == "🖼️ Image (upload)":
                         for i, (img_path, score, style_name) in enumerate(results):
                             with result_cols[i % 3]:
                                 try:
-                                    # Normaliser le chemin pour Windows/Linux
                                     img_path_normalized = os.path.normpath(img_path).replace("\\", "/")
                                     result_img = Image.open(img_path_normalized)
                                     st.image(result_img, use_container_width=True)
                                     st.caption(f"💡 {style_name}")
-                                    # Bouton pour essayer cette coiffure
                                     if st.button(f"✂️ Essayer", key=f"try_{i}"):
                                         st.session_state.selected_hairstyle = img_path_normalized
                                 except Exception as e:
@@ -522,7 +691,7 @@ if mode == "🖼️ Image (upload)":
                     else:
                         st.warning("Aucune recommandation trouvée. Essaie d'ajouter plus d'images au dataset.")
                 
-                # Section essayage avec transfert de coiffure
+                # Section essayage avec transfert de coiffure (offline)
                 if "selected_hairstyle" in st.session_state and st.session_state.selected_hairstyle:
                     st.markdown("---")
                     st.subheader("✨ Résultat de l'essayage")
@@ -531,12 +700,10 @@ if mode == "🖼️ Image (upload)":
                         from hair_transfer import transfer_hairstyle
                         
                         with st.spinner("🔄 Transfert de la coiffure en cours..."):
-                            # Récupérer les landmarks
                             if res.multi_face_landmarks:
                                 lms = res.multi_face_landmarks[0]
                                 landmarks_xy = [(int(lm.x * w), int(lm.y * h)) for lm in lms.landmark]
                                 
-                                # Appliquer le transfert
                                 transferred = transfer_hairstyle(
                                     bgr.copy(),
                                     st.session_state.selected_hairstyle,
@@ -552,7 +719,6 @@ if mode == "🖼️ Image (upload)":
                                     st.image(cv2.cvtColor(transferred, cv2.COLOR_BGR2RGB), 
                                              caption="Après", use_container_width=True)
                                 
-                                # Bouton pour réinitialiser
                                 if st.button("🔄 Essayer une autre coiffure"):
                                     st.session_state.selected_hairstyle = None
                                     st.rerun()

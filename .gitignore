@@ -6,3 +6,7 @@ venv/
 models/
 */.models/
 */models/
+.hairstyle_images/
+hairstyle_images/
+*/.hairstyle_images/
+*/hairstyle_images/

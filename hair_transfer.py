@@ -158,7 +158,7 @@ class HairTransfer:
         
         # Position sur la cible (au-dessus du front)
         paste_x = target_bounds["center_x"] - new_width // 2
-        paste_y = target_bounds["top"] - int(new_height * 0.7)
+        paste_y = target_bounds["top"] - int(new_height * 0.43)
         
         # Créer le résultat
         result = target_image.copy()
