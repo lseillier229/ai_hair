@@ -10,6 +10,10 @@ from streamlit_webrtc import webrtc_streamer, VideoTransformerBase, WebRtcMode, 
 import mediapipe as mp
 from hair_transfer import HairTransfer  
 
+
+if "live_face_shape" not in st.session_state:
+    st.session_state.live_face_shape = "unknown"
+
 # ----- (optionnel) ONNX Runtime pour BiSeNet -----
 try:
     import onnxruntime as ort
@@ -331,10 +335,50 @@ mask_alpha = 0.35 if show_mask else 0.0
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("Filtre coiffure (live)")
-enable_hair_filter = st.sidebar.checkbox("Activer le filtre coiffure sur la caméra", value=False)
-hair_source_path = st.sidebar.text_input("Chemin de l'image coiffure à tester", value="hairstyle_images/img_align_celeba/000005.jpg")
+auto_hair = st.sidebar.checkbox("🎯 Auto: recommander + appliquer une coiffure", value=True)
+enable_hair_filter = st.sidebar.checkbox("Activer le filtre coiffure sur la caméra", value=False, disabled=auto_hair)
+
+hair_source_path = st.sidebar.text_input(
+    "Chemin de l'image coiffure à tester (mode manuel)",
+    value="hairstyle_images/img_align_celeba/000005.jpg",
+    disabled=auto_hair
+)
+
 
 # ====== MODE CAMÉRA ======
+def pick_hairstyle_source_for_shape(face_shape: str, index_path="hairstyle_index"):
+    """
+    Retourne un chemin d'image coiffure (source) à appliquer en live.
+    - Si l'index FAISS existe : on prend une reco IA (1ère)
+    - Sinon : fallback sur des images "demo" (à adapter)
+    """
+    index_ok = os.path.exists(os.path.join(index_path, "faiss.index"))
+
+    if index_ok:
+        try:
+            from hairstyle_search import recommend_for_face_shape
+            results = recommend_for_face_shape(face_shape, current_image=None, top_k=1, index_path=index_path)
+            if results:
+                img_path, score, style_name = results[0]
+                # normaliser le chemin
+                return os.path.normpath(img_path).replace("\\", "/")
+        except Exception as e:
+            print("[AutoHair] IA indisponible, fallback:", e)
+
+    # ===== Fallback si pas d'index =====
+    fallback = {
+        "round":  "hairstyle_images/img_align_celeba/000005.jpg",
+        "oval":   "hairstyle_images/img_align_celeba/000010.jpg",
+        "square": "hairstyle_images/img_align_celeba/000020.jpg",
+        "heart":  "hairstyle_images/img_align_celeba/000030.jpg",
+        "diamond":"hairstyle_images/img_align_celeba/000040.jpg",
+        "oblong": "hairstyle_images/img_align_celeba/000050.jpg",
+        "unknown":"hairstyle_images/img_align_celeba/000005.jpg",
+    }
+    return fallback.get(face_shape, fallback["unknown"])
+
+
+
 class LiveTransformer(VideoTransformerBase):
     def __init__(self, use_bisenet=False, bisenet_path="models/bisenet_faceparsing.onnx",
                  mask_alpha=0.35, mask_color=(255,0,0),
@@ -352,11 +396,16 @@ class LiveTransformer(VideoTransformerBase):
             min_tracking_confidence=0.5
         )
         self.seg_fallback = mp_selfie_seg.SelfieSegmentation(model_selection=1)
+        self.bisenet_path = bisenet_path
 
         self.use_bisenet = False
         self.bisenet = None
         self.mask_alpha = mask_alpha
         self.mask_color = mask_color
+        self.auto_hair = auto_hair
+        self.current_hair_source = None
+        self.stable_shape = None
+        self.stable_count = 0
 
         if use_bisenet and HAS_ORT and os.path.isfile(bisenet_path):
             try:
@@ -366,20 +415,18 @@ class LiveTransformer(VideoTransformerBase):
             except Exception as e:
                 print("[BiSeNet] Load failed:", e)
 
-        self.enable_hair_filter = enable_hair_filter
+        self.enable_hair_filter = enable_hair_filter or self.auto_hair
         self.fast_hair = None
 
-        if self.enable_hair_filter and hair_source_path and os.path.isfile(hair_source_path):
+        if (not self.auto_hair) and self.enable_hair_filter and hair_source_path and os.path.isfile(hair_source_path):
             try:
                 src_bgr = cv2.imread(hair_source_path)
                 if src_bgr is not None:
                     self.fast_hair = FastHairFilter(src_bgr, bisenet_path)
-                else:
-                    print(f"[Live] Impossible de lire la coiffure: {hair_source_path}")
+                    self.current_hair_source = hair_source_path
             except Exception as e:
                 print(f"[Live] Erreur init FastHairFilter: {e}")
-        elif self.enable_hair_filter:
-            print(f"[Live] Fichier coiffure introuvable: {hair_source_path}")
+
 
     def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
         img_full = frame.to_ndarray(format="bgr24")
@@ -401,7 +448,24 @@ class LiveTransformer(VideoTransformerBase):
 
         landmarks_xy = None
         shape = self.last_shape
+        if self.stable_shape == shape:
+            self.stable_count += 1
+        else:
+            self.stable_shape = shape
+            self.stable_count = 1
 
+        # Après 4 validations (donc ~ 4 * 3 frames), on considère la forme stable
+        if self.auto_hair and self.stable_count == 4:
+            new_source = pick_hairstyle_source_for_shape(shape)
+            if new_source and new_source != self.current_hair_source and os.path.isfile(new_source):
+                try:
+                    src_bgr = cv2.imread(new_source)
+                    if src_bgr is not None:
+                        self.fast_hair = FastHairFilter(src_bgr, self.bisenet_path)
+                        self.current_hair_source = new_source
+                        print(f"[AutoHair] New hair source: {new_source}")
+                except Exception as e:
+                    print("[AutoHair] Erreur chargement:", e)
         if recompute_face:
             res = self.face_mesh.process(rgb)
             if res.multi_face_landmarks:
@@ -410,6 +474,8 @@ class LiveTransformer(VideoTransformerBase):
                 pts = np.array(landmarks_xy, dtype=np.float32)
                 shape, _ = face_shape_from_landmarks(pts)
                 self.last_shape = shape
+                st.session_state.live_face_shape = shape
+
                 self.last_landmarks = landmarks_xy
                 # ❌ On NE dessine PAS les traits blancs en live
         else:
@@ -727,28 +793,49 @@ if mode == "🖼️ Image (upload)":
                     except Exception as e:
                         st.error(f"Erreur lors du transfert: {e}")
                         st.session_state.selected_hairstyle = None
-                
+                if "text_search_results" not in st.session_state:
+                    st.session_state.text_search_results = None
+                if "text_search_query" not in st.session_state:
+                    st.session_state.text_search_query = ""
+
                 # Option recherche textuelle
+
                 st.markdown("---")
                 st.subheader("🔍 Ou recherche par description")
-                text_query = st.text_input("Décris la coiffure recherchée :", 
-                                           placeholder="ex: short curly hair, long straight blonde...")
-                if text_query and st.button("🔎 Rechercher"):
-                    with st.spinner("Recherche en cours..."):
-                        results = search_by_text(text_query, top_k=6)
-                        
-                        if results:
-                            st.success(f"✅ {len(results)} résultats pour '{text_query}'")
-                            result_cols = st.columns(3)
-                            for i, (img_path, score) in enumerate(results):
-                                with result_cols[i % 3]:
-                                    try:
-                                        result_img = Image.open(img_path)
-                                        st.image(result_img, caption=f"Score: {score:.2f}", use_container_width=True)
-                                    except:
-                                        st.write(f"Image: {os.path.basename(img_path)}")
-                        else:
-                            st.warning("Aucun résultat trouvé")
+
+                text_query = st.text_input(
+                    "Décris la coiffure recherchée :",
+                    placeholder="ex: short curly hair, long straight blonde.",
+                    value=st.session_state.text_search_query
+                )
+
+                if st.button("🔎 Rechercher", key="do_text_search") and text_query:
+                    st.session_state.text_search_query = text_query
+                    with st.spinner("Recherche en cours."):
+                        st.session_state.text_search_results = search_by_text(text_query, top_k=6)
+
+                # ✅ AFFICHAGE PERSISTANT (même après "Essayer")
+                results = st.session_state.text_search_results
+                if results:
+                    st.success(f"✅ {len(results)} résultats pour '{st.session_state.text_search_query}'")
+                    result_cols = st.columns(3)
+
+                    for i, (img_path, score) in enumerate(results):
+                        with result_cols[i % 3]:
+                            try:
+                                img_path_normalized = os.path.normpath(img_path).replace("\\", "/")
+                                result_img = Image.open(img_path_normalized)
+                                st.image(result_img, caption=f"Score: {score:.2f}", use_container_width=True)
+
+                                if st.button("✂️ Essayer", key=f"text_try_{i}"):
+                                    st.session_state.selected_hairstyle = img_path_normalized
+                                    # ✅ PAS besoin de st.rerun(); le click provoque déjà un rerun
+                            except Exception as e:
+                                st.warning(f"❌ {os.path.basename(img_path)}")
+                                st.caption(f"Erreur: {e}")
+                elif st.session_state.text_search_query:
+                    st.info("Aucun résultat (ou recherche pas encore lancée).")
+
                                 
             except ImportError as e:
                 st.error(f"Module manquant: {e}")
